@@ -1,3 +1,4 @@
+pub mod emeans;
 pub mod encoded_storage;
 pub mod encoded_vectors;
 pub mod encoded_vectors_binary;

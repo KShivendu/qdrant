@@ -18,16 +18,21 @@ use common::types::PointOffsetType;
 use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use fs_err as fs;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::emeans::{EmeansParams, emeans};
 use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, validate_storage_vector_size};
 use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
-use crate::kmeans::kmeans;
 use crate::{ConditionalVariable, EncodingError};
 
+/// Training sample for the codebooks. A 100k sample lowers held-out reconstruction error by
+/// 3-13% and lifts recall on 1M-scale SIFT/GloVe, but lowered recall on 100k x 1536-d OpenAI
+/// embeddings at x64, so the sample stays at 10k. See lib/quantization/docs/emeans-pq-benchmark.md.
 pub const KMEANS_SAMPLE_SIZE: usize = 10_000;
-pub const KMEANS_MAX_ITERATIONS: usize = 100;
-pub const KMEANS_ACCURACY: f32 = 1e-5;
+pub const EMEANS_EPOCHS: usize = 5;
+/// Max bytes of sub-vector samples gathered at once (one pass over the data per group).
+const SAMPLE_GROUP_BYTES: usize = 64 << 20;
 pub const CENTROIDS_COUNT: usize = 256;
 
 pub struct EncodedVectorsPQ<TStorage: EncodedStorage> {
@@ -369,16 +374,36 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         }
 
         selected_vectors.sort_unstable();
+        let seed: u64 = rand::random();
 
-        // find centroids for each chunk
-        for range in vector_division.iter() {
-            // take data subset using indexes from
-            let mut data_subset = Vec::with_capacity(sample_size * range.len());
+        let threads = max_kmeans_threads.max(1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|idx| format!("pq-codebook-{idx}"))
+            .num_threads(threads)
+            .build()
+            .map_err(|e| {
+                EncodingError::EncodingError(format!(
+                    "Failed PQ encoding while thread pool init: {e}"
+                ))
+            })?;
+
+        // Chunks are independent: gather samples for a group of chunks in one pass over the
+        // data, then train the group's codebooks in parallel, one chunk per thread.
+        let max_chunk = vector_division.iter().map(|r| r.len()).max().unwrap_or(1);
+        let group_size =
+            (SAMPLE_GROUP_BYTES / (sample_size * max_chunk * size_of::<f32>())).clamp(1, threads);
+        for (group_index, group) in vector_division.chunks(group_size).enumerate() {
+            let mut subsets: Vec<Vec<f32>> = group
+                .iter()
+                .map(|range| Vec::with_capacity(sample_size * range.len()))
+                .collect();
             let mut selected_index: usize = 0;
             for (vector_index, vector_data) in data.clone().enumerate() {
-                let vector_data = vector_data.as_ref();
                 if vector_index == selected_vectors[selected_index] {
-                    data_subset.extend_from_slice(&vector_data[range.clone()]);
+                    let vector_data = vector_data.as_ref();
+                    for (subset, range) in subsets.iter_mut().zip(group) {
+                        subset.extend_from_slice(&vector_data[range.clone()]);
+                    }
                     selected_index += 1;
                     if selected_index == sample_size {
                         break;
@@ -386,19 +411,30 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
                 }
             }
 
-            let centroids = kmeans(
-                &data_subset,
-                centroids_count,
-                range.len(),
-                KMEANS_MAX_ITERATIONS,
-                max_kmeans_threads,
-                KMEANS_ACCURACY,
-                stopped,
-            )?;
+            let trained: Vec<Result<Vec<f32>, EncodingError>> = pool.install(|| {
+                subsets
+                    .par_iter()
+                    .zip(group.par_iter())
+                    .enumerate()
+                    .map(|(i, (subset, range))| {
+                        let params = EmeansParams {
+                            nepochs: EMEANS_EPOCHS,
+                            seed: seed.wrapping_add((group_index * group_size + i) as u64),
+                            ..Default::default()
+                        };
+                        emeans(subset, centroids_count, range.len(), &params, None, stopped)
+                    })
+                    .collect()
+            });
 
             // push found chunk centroids into result
-            for (centroid_index, centroid_data) in centroids.chunks_exact(range.len()).enumerate() {
-                result[centroid_index].extend_from_slice(centroid_data);
+            for (centroids, range) in trained.into_iter().zip(group) {
+                let centroids = centroids?;
+                for (centroid_index, centroid_data) in
+                    centroids.chunks_exact(range.len()).enumerate()
+                {
+                    result[centroid_index].extend_from_slice(centroid_data);
+                }
             }
         }
 
