@@ -59,6 +59,9 @@ pub struct EmeansParams {
     /// Overrides the step law.
     pub alpha0: Option<f64>,
     pub seed: u64,
+    /// Revive clusters whose mass is below this fraction of the mean. `None`: 0.1, or 0 (off)
+    /// for `dim <= 2`.
+    pub unused_threshold: Option<f32>,
 }
 
 impl Default for EmeansParams {
@@ -69,6 +72,7 @@ impl Default for EmeansParams {
             batch_size: None,
             alpha0: None,
             seed: 1234,
+            unused_threshold: None,
         }
     }
 }
@@ -126,11 +130,13 @@ pub fn resolve_recipe(n: usize, k: usize, dim: usize, params: &EmeansParams) -> 
         batch_size,
         alpha0,
         total_steps: steps_per_epoch * params.nepochs,
-        unused_threshold: if dim <= NO_REVIVAL_MAX_D {
-            0.0
-        } else {
-            UNUSED_THRESHOLD
-        },
+        unused_threshold: params
+            .unused_threshold
+            .unwrap_or(if dim <= NO_REVIVAL_MAX_D {
+                0.0
+            } else {
+                UNUSED_THRESHOLD
+            }),
     }
 }
 

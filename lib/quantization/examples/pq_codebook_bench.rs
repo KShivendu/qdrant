@@ -7,13 +7,13 @@
 //! Input directory: `base.f32`, `query.f32` (row-major f32), `gt.u32` (nq x gt_k ids),
 //! `meta.json` with `n`, `d`, `nq`, `metric` ("l2" or "dot"), `gt_k`.
 //!
-//! cargo run --release --example pq_codebook_bench -- <dir> <bucket> <threads> <seeds> <configs>
-//! configs: comma list of `lloyd:<sample>:<iters>` or `emeans:<sample>:<epochs>`.
+//! cargo run --release --example pq_codebook_bench -- <dir> <bucket> <threads> <seeds> <configs> [max_queries]
+//! configs: comma list of `lloyd:<sample>:<iters>` or `emeans:<sample>:<epochs>[:norev|thr|qual]`.
 
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use quantization::emeans::{EmeansParams, emeans, resolve_recipe};
+use quantization::emeans::{BatchLaw, EmeansParams, emeans, resolve_recipe};
 use quantization::kmeans::kmeans;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -50,8 +50,14 @@ fn meta_field(meta: &str, key: &str) -> String {
 
 #[derive(Clone, Copy)]
 enum Algo {
-    Lloyd { iters: usize },
-    Emeans { epochs: usize },
+    Lloyd {
+        iters: usize,
+    },
+    Emeans {
+        epochs: usize,
+        revive: Option<f32>,
+        law: BatchLaw,
+    },
 }
 
 fn nearest(x: &[f32], centroids: &[f32], dim: usize) -> (u8, f32) {
@@ -79,7 +85,16 @@ fn main() {
             let x = p[2].parse().unwrap();
             let algo = match p[0] {
                 "lloyd" => Algo::Lloyd { iters: x },
-                "emeans" => Algo::Emeans { epochs: x },
+                "emeans" => Algo::Emeans {
+                    epochs: x,
+                    // optional 4th field: norev | thr | qual
+                    revive: (p.get(3) == Some(&"norev")).then_some(0.0),
+                    law: match p.get(3) {
+                        Some(&"thr") => BatchLaw::Throughput,
+                        Some(&"qual") => BatchLaw::Quality,
+                        _ => BatchLaw::Auto,
+                    },
+                },
                 _ => panic!("unknown algo {}", p[0]),
             };
             (c.to_string(), algo, sample)
@@ -88,11 +103,15 @@ fn main() {
 
     let meta = fs_err::read_to_string(format!("{dir}/meta.json")).unwrap();
     let d: usize = meta_field(&meta, "d").parse().unwrap();
-    let nq: usize = meta_field(&meta, "nq").parse().unwrap();
+    let nq_file: usize = meta_field(&meta, "nq").parse().unwrap();
+    let nq = args
+        .get(6)
+        .map_or(nq_file, |a| a.parse::<usize>().unwrap().min(nq_file));
     let gt_k: usize = meta_field(&meta, "gt_k").parse().unwrap();
     let dot = meta_field(&meta, "metric") == "dot";
     let base = read_f32(&format!("{dir}/base.f32"));
-    let query = read_f32(&format!("{dir}/query.f32"));
+    let mut query = read_f32(&format!("{dir}/query.f32"));
+    query.truncate(nq * d);
     let gt: Vec<u32> = bytemuck_cast(&fs_err::read(format!("{dir}/gt.u32")).unwrap());
     let n = base.len() / d;
     rayon::ThreadPoolBuilder::new()
@@ -133,9 +152,15 @@ fn main() {
                     Algo::Lloyd { iters } => {
                         kmeans(&sub, K, r.len(), iters, threads, 1e-5, &stopped).unwrap()
                     }
-                    Algo::Emeans { epochs } => {
+                    Algo::Emeans {
+                        epochs,
+                        revive,
+                        law,
+                    } => {
                         let params = EmeansParams {
                             nepochs: epochs,
+                            unused_threshold: revive,
+                            batch_law: law,
                             seed: seed * 1000 + ci as u64,
                             ..Default::default()
                         };
@@ -193,7 +218,16 @@ fn main() {
                 / nq as f64;
 
             // ADC search, recall@10 raw and after exact rescoring of top-100.
-            let (hits_raw, hits_rescored): (usize, usize) = query
+            // Also: PQ score error on each query's true top-10 vs on 10 random points.
+            #[allow(clippy::type_complexity)]
+            let (hits_raw, hits_rescored, nn_bias, nn_sq, rnd_bias, rnd_sq): (
+                usize,
+                usize,
+                f64,
+                f64,
+                f64,
+                f64,
+            ) = query
                 .par_chunks_exact(d)
                 .enumerate()
                 .map(|(qi, q)| {
@@ -245,16 +279,56 @@ fn main() {
                         .collect();
                     exact.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
                     let rescored = exact[..TOP].iter().filter(|s| truth.contains(&s.1)).count();
-                    (raw, rescored)
+                    let err = |i: usize| -> f64 {
+                        let pq: f32 = codes[i * m..(i + 1) * m]
+                            .iter()
+                            .enumerate()
+                            .map(|(ci, &c)| lut[ci * K + c as usize])
+                            .sum();
+                        let x = &base[i * d..(i + 1) * d];
+                        let ex: f32 = if dot {
+                            q.iter().zip(x).map(|(a, b)| a * b).sum()
+                        } else {
+                            -q.iter().zip(x).map(|(a, b)| (a - b) * (a - b)).sum::<f32>()
+                        };
+                        f64::from(pq - ex)
+                    };
+                    let (mut nb, mut ns, mut rb, mut rs) = (0f64, 0f64, 0f64, 0f64);
+                    for (k, &t) in truth.iter().enumerate() {
+                        let e = err(t as usize);
+                        nb += e;
+                        ns += e * e;
+                        let r = (qi * 7919 + k * 104_729) % n;
+                        let e = err(r);
+                        rb += e;
+                        rs += e * e;
+                    }
+                    (raw, rescored, nb, ns, rb, rs)
                 })
-                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+                .reduce(
+                    || (0, 0, 0.0, 0.0, 0.0, 0.0),
+                    |a, b| {
+                        (
+                            a.0 + b.0,
+                            a.1 + b.1,
+                            a.2 + b.2,
+                            a.3 + b.3,
+                            a.4 + b.4,
+                            a.5 + b.5,
+                        )
+                    },
+                );
             let denom = (nq * TOP) as f64;
             let (batch, alpha0) = recipe.map_or((0, 0.0), |r| (r.batch_size, r.alpha0));
             println!(
-                "{{\"dataset\":\"{ds}\",\"bucket\":{bucket},\"config\":\"{name}\",\"seed\":{seed},\"sample\":{sample},\"threads\":{threads},\"train_s\":{train_s:.4},\"encode_s\":{encode_s:.3},\"mse_base\":{mse:.6},\"mse_heldout\":{:.6},\"mse_query\":{qerr:.6},\"recall10\":{:.4},\"recall10_rescore100\":{:.4},\"batch\":{batch},\"alpha0\":{alpha0:.4}}}",
+                "{{\"dataset\":\"{ds}\",\"bucket\":{bucket},\"config\":\"{name}\",\"seed\":{seed},\"sample\":{sample},\"threads\":{threads},\"train_s\":{train_s:.4},\"encode_s\":{encode_s:.3},\"mse_base\":{mse:.6},\"mse_heldout\":{:.6},\"mse_query\":{qerr:.6},\"recall10\":{:.4},\"recall10_rescore100\":{:.4},\"batch\":{batch},\"alpha0\":{alpha0:.4},\"nn_bias\":{:.6},\"nn_rmse\":{:.6},\"rnd_bias\":{:.6},\"rnd_rmse\":{:.6}}}",
                 held_err / held_n.max(1) as f64,
                 hits_raw as f64 / denom,
                 hits_rescored as f64 / denom,
+                nn_bias / denom,
+                (nn_sq / denom).sqrt(),
+                rnd_bias / denom,
+                (rnd_sq / denom).sqrt(),
             );
         }
     }
