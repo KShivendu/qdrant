@@ -18,16 +18,28 @@ use common::types::PointOffsetType;
 use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use fs_err as fs;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::emeans::{EmeansParams, emeans};
 use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, validate_storage_vector_size};
 use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
 use crate::kmeans::kmeans;
 use crate::{ConditionalVariable, EncodingError};
 
+/// Training sample for the codebooks. A 100k sample lowers reconstruction error by 2-13%, but
+/// lowered rescored recall on OpenAI embeddings at x64 (100K and 1M), so it stays at 10k.
+/// See lib/quantization/docs/emeans-pq-benchmark.md.
 pub const KMEANS_SAMPLE_SIZE: usize = 10_000;
 pub const KMEANS_MAX_ITERATIONS: usize = 100;
 pub const KMEANS_ACCURACY: f32 = 1e-5;
+/// e-means trains chunks of up to this many dims (x4, x8, x16). It matched or beat Lloyd there
+/// and built 2.9x faster on 1536-d data. With 16-dim chunks (x64) it cost 0.3-0.5 points of
+/// rescored recall@10 on OpenAI embeddings, so x32 and x64 keep Lloyd.
+pub const EMEANS_MAX_CHUNK_DIM: usize = 4;
+pub const EMEANS_EPOCHS: usize = 5;
+/// Max bytes of sub-vector samples gathered at once (one pass over the data per group).
+const SAMPLE_GROUP_BYTES: usize = 64 << 20;
 pub const CENTROIDS_COUNT: usize = 256;
 
 pub struct EncodedVectorsPQ<TStorage: EncodedStorage> {
@@ -370,6 +382,101 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
 
         selected_vectors.sort_unstable();
 
+        if vector_division
+            .iter()
+            .any(|range| range.len() > EMEANS_MAX_CHUNK_DIM)
+        {
+            Self::find_centroids_lloyd(
+                data,
+                vector_division,
+                &selected_vectors,
+                centroids_count,
+                max_kmeans_threads,
+                stopped,
+                &mut result,
+            )?;
+            return Ok(result);
+        }
+
+        let seed: u64 = rand::random();
+
+        let threads = max_kmeans_threads.max(1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|idx| format!("pq-codebook-{idx}"))
+            .num_threads(threads)
+            .build()
+            .map_err(|e| {
+                EncodingError::EncodingError(format!(
+                    "Failed PQ encoding while thread pool init: {e}"
+                ))
+            })?;
+
+        // Chunks are independent: gather samples for a group of chunks in one pass over the
+        // data, then train the group's codebooks in parallel, one chunk per thread.
+        let max_chunk = vector_division.iter().map(|r| r.len()).max().unwrap_or(1);
+        let group_size =
+            (SAMPLE_GROUP_BYTES / (sample_size * max_chunk * size_of::<f32>())).clamp(1, threads);
+        for (group_index, group) in vector_division.chunks(group_size).enumerate() {
+            let mut subsets: Vec<Vec<f32>> = group
+                .iter()
+                .map(|range| Vec::with_capacity(sample_size * range.len()))
+                .collect();
+            let mut selected_index: usize = 0;
+            for (vector_index, vector_data) in data.clone().enumerate() {
+                if vector_index == selected_vectors[selected_index] {
+                    let vector_data = vector_data.as_ref();
+                    for (subset, range) in subsets.iter_mut().zip(group) {
+                        subset.extend_from_slice(&vector_data[range.clone()]);
+                    }
+                    selected_index += 1;
+                    if selected_index == sample_size {
+                        break;
+                    }
+                }
+            }
+
+            let trained: Vec<Result<Vec<f32>, EncodingError>> = pool.install(|| {
+                subsets
+                    .par_iter()
+                    .zip(group.par_iter())
+                    .enumerate()
+                    .map(|(i, (subset, range))| {
+                        let params = EmeansParams {
+                            nepochs: EMEANS_EPOCHS,
+                            seed: seed.wrapping_add((group_index * group_size + i) as u64),
+                            ..Default::default()
+                        };
+                        emeans(subset, centroids_count, range.len(), &params, None, stopped)
+                    })
+                    .collect()
+            });
+
+            // push found chunk centroids into result
+            for (centroids, range) in trained.into_iter().zip(group) {
+                let centroids = centroids?;
+                for (centroid_index, centroid_data) in
+                    centroids.chunks_exact(range.len()).enumerate()
+                {
+                    result[centroid_index].extend_from_slice(centroid_data);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Lloyd k-means per chunk, chunks one after another, each using `max_kmeans_threads`.
+    fn find_centroids_lloyd<'a>(
+        data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone,
+        vector_division: &[Range<usize>],
+        selected_vectors: &[usize],
+        centroids_count: usize,
+        max_kmeans_threads: usize,
+        stopped: &AtomicBool,
+        result: &mut [Vec<f32>],
+    ) -> Result<(), EncodingError> {
+        let sample_size = selected_vectors.len();
+
         // find centroids for each chunk
         for range in vector_division.iter() {
             // take data subset using indexes from
@@ -402,7 +509,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
