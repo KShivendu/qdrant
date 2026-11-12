@@ -1,8 +1,0 @@
-{"label":"old","dataset":"vdb1m","bucket":16,"threads":4,"encode_s":117.884,"recall10":0.5022,"recall10_rescore100":0.9122}
-{"label":"new10k","dataset":"vdb1m","bucket":16,"threads":4,"encode_s":97.163,"recall10":0.5182,"recall10_rescore100":0.9120}
-{"label":"old","dataset":"vdb1m","bucket":16,"threads":4,"encode_s":117.596,"recall10":0.5114,"recall10_rescore100":0.9224}
-{"label":"new10k","dataset":"vdb1m","bucket":16,"threads":4,"encode_s":91.938,"recall10":0.5090,"recall10_rescore100":0.9122}
-{"label":"old","dataset":"vdb1m","bucket":4,"threads":4,"encode_s":180.579,"recall10":0.8190,"recall10_rescore100":0.9996}
-{"label":"new10k","dataset":"vdb1m","bucket":4,"threads":4,"encode_s":156.466,"recall10":0.8214,"recall10_rescore100":0.9998}
-{"label":"old","dataset":"vdb1m","bucket":4,"threads":4,"encode_s":180.950,"recall10":0.8130,"recall10_rescore100":1.0000}
-{"label":"new10k","dataset":"vdb1m","bucket":4,"threads":4,"encode_s":152.897,"recall10":0.8116,"recall10_rescore100":0.9998}

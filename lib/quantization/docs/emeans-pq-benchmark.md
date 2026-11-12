@@ -35,8 +35,8 @@ final pass of exact means. `src/emeans.rs` ports the reference NumPy version.
 
 ## Server test: vector-db-benchmark against a running Qdrant
 
-`qdrant` built with `--profile perf` from both commits. Config `examples/emeans/server/vdb-qdrant-pq.json`
-mirrors upstream `qdrant-quantizations.json` (m=16, ef_construct=128, 2 segments, always_ram) with
+`qdrant` built with `--profile perf` from both commits. The vector-db-benchmark config (not in
+this repo) mirrors upstream `qdrant-quantizations.json` (m=16, ef_construct=128, 2 segments, always_ram) with
 `product` x16 and x64. 12 search settings, 5000 queries each. 3 runs per binary, order old, new, new,
 old, old, new. Indexing time is from upload end to the collection turning green with every vector
 indexed, polled every 0.2 s.
@@ -222,14 +222,14 @@ Single-threaded, at the same 10k sample, e-means needs 13.4x less CPU than Lloyd
 
 ## Reproduce
 
-```sh
-python3 examples/emeans/prep_vdb.py <extracted vdb dataset dir> <out dir>
-cargo run --release --example pq_codebook_bench -- <out dir> 16 4 5 lloyd:10000:100,emeans:10000:5 2000
-cargo run --release --example pq_e2e_bench -- <out dir> 4 4 2000 label
-S=<scratch> bash examples/emeans/run_server_bench.sh old new new old old new
-```
+Bench inputs are raw files in one directory: `base.f32` and `query.f32` (row-major f32),
+`gt.u32` (top-k ids per query) and `meta.json` (`n`, `d`, `nq`, `metric`, `gt_k`). Convert the
+vector-db-benchmark `vectors.npy` / `tests.jsonl` into that layout first.
 
-Raw results are in `examples/emeans/*.jsonl` and `examples/emeans/server/`.
+```sh
+cargo run --release --example pq_codebook_bench -- <dir> 16 4 5 lloyd:10000:100,emeans:10000:5 2000
+cargo run --release --example pq_e2e_bench -- <dir> 4 4 2000 label
+```
 
 ## Not covered
 

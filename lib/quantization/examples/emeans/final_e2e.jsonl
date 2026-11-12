@@ -1,4 +1,0 @@
-{"label":"final","dataset":"vdb100k","bucket":16,"threads":4,"encode_s":31.385,"recall10":0.5099,"recall10_rescore100":0.9362}
-{"label":"final","dataset":"vdb100k","bucket":16,"threads":4,"encode_s":33.001,"recall10":0.5081,"recall10_rescore100":0.9329}
-{"label":"final","dataset":"vdb100k","bucket":4,"threads":4,"encode_s":20.098,"recall10":0.8223,"recall10_rescore100":1.0000}
-{"label":"final","dataset":"vdb100k","bucket":4,"threads":4,"encode_s":19.811,"recall10":0.8230,"recall10_rescore100":1.0000}
